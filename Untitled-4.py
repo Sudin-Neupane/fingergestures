@@ -1,0 +1,880 @@
+
+
+import cv2
+import mediapipe as mp
+import pyautogui
+import numpy as np
+import time
+import urllib.request
+import os
+import traceback
+import random
+import math
+from collections import deque
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+# Fix Windows PowerShell unicode encoding crash
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+HAS_VOLUME  = False
+volume_ctrl = None
+VOL_MIN = VOL_MAX = 0
+
+try:
+    import ctypes
+    _comtypes_mod  = importlib.import_module("comtypes")
+    _pycaw_mod     = importlib.import_module("pycaw.pycaw")
+
+    CLSCTX_ALL          = _comtypes_mod.CLSCTX_ALL                         # type: ignore[attr-defined]
+    AudioUtilities      = _pycaw_mod.AudioUtilities                         # type: ignore[attr-defined]
+    IAudioEndpointVolume= _pycaw_mod.IAudioEndpointVolume                   # type: ignore[attr-defined]
+
+    _devices    = AudioUtilities.GetSpeakers()
+    _interface  = _devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    volume_ctrl = ctypes.cast(_interface, ctypes.POINTER(IAudioEndpointVolume))
+    VOL_MIN, VOL_MAX = volume_ctrl.GetVolumeRange()[:2]
+    HAS_VOLUME  = True
+    print("[OK] pycaw volume control enabled")
+except ImportError:
+    print("[INFO] pycaw/comtypes not installed - using keyboard volume fallback")
+except Exception as e:
+    print(f"[INFO] Volume control unavailable: {e}")
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE    = 0
+
+
+#  CONFIG
+
+CAMERA_INDEX        = 0
+MODEL_FILE          = "hand_landmarker.task"
+SCREEN_W, SCREEN_H  = pyautogui.size()
+
+MODES = ["CURSOR", "VOLUME", "ZOOM", "PRESENT"]
+
+THEME = {
+    "CURSOR":  {"primary": (0, 255, 180),  "accent": (180, 0, 255)},
+    "VOLUME":  {"primary": (0, 200, 255),  "accent": (255, 150, 0)},
+    "ZOOM":    {"primary": (255, 220, 0),  "accent": (0, 180, 255)},
+    "PRESENT": {"primary": (255, 80, 120), "accent": (255, 200, 0)},
+}
+
+# ── Thresholds (normalised to hand scale)
+T = {
+    "PINCH_ON":    0.13,   # slightly easier to trigger pinch
+    "PINCH_OFF":   0.20,   # wider hysteresis = cleaner release
+    "RMID_ON":     0.13,
+    "RMID_OFF":    0.20,
+    "DRAG_ON":     0.09,
+    "DRAG_OFF":    0.15,
+    "CURL_UP":     0.60,
+    "CURL_DOWN":   0.35,
+    "SCROLL_DEAD": 0.008,  # smaller dead zone = scroll responds sooner
+    "SCROLL_SPEED":20000.0,   # pixels of scroll per pixel of hand movement
+    "SWIPE_MIN":   0.18,   # slightly easier swipe trigger
+}
+
+# ── Gesture buffer config: {gesture: (buffer_size, confidence_ratio)} ─────
+# Smaller buffers = faster response. Lower ratio = more forgiving detection.
+BUFFER_CFG = {
+    "MOVE_CURSOR":  (2,  0.50),   # was (3,0.67) — instant cursor response
+    "LEFT_CLICK":   (4,  0.75),   # was (5,0.80) — slightly faster click
+    "RIGHT_CLICK":  (5,  0.80),   # was (6,0.83)
+    "DRAG":         (3,  0.67),   # was (4,0.75)
+    "SCROLL":       (2,  0.50),   # was (4,0.75) — scroll starts immediately
+    "VOLUME":       (2,  0.50),   # was (3,0.67)
+    "ZOOM":         (2,  0.50),
+    "PAUSE":        (4,  0.75),
+    "MODE_SWITCH":  (36, 1.00),   # keep — intentional hold required
+    "SWIPE_LEFT":   (5,  0.80),
+    "SWIPE_RIGHT":  (5,  0.80),
+    "IDLE":         (2,  0.50),
+}
+
+COOLDOWNS = {
+    "LEFT_CLICK":  0.35,   # was 0.40 — snappier clicking
+    "RIGHT_CLICK": 0.45,   # was 0.50
+    "MODE_SWITCH": 2.00,
+    "SWIPE_LEFT":  0.50,   # was 0.60
+    "SWIPE_RIGHT": 0.50,
+}
+
+# Lower number = higher priority; only one gesture fires per frame
+PRIORITY = {
+    "PAUSE":       1,
+    "MODE_SWITCH": 2,
+    "LEFT_CLICK":  3,
+    "RIGHT_CLICK": 4,
+    "DRAG":        5,
+    "SCROLL":      6,
+    "ZOOM":        6,
+    "VOLUME":      6,
+    "SWIPE_LEFT":  7,
+    "SWIPE_RIGHT": 7,
+    "MOVE_CURSOR": 8,
+    "IDLE":        9,
+}
+
+# Gestures allowed in each mode (easy extensibility — add here + BUFFER_CFG)
+MODE_GESTURES = {
+    "CURSOR":  {"MOVE_CURSOR", "LEFT_CLICK", "RIGHT_CLICK", "DRAG", "SCROLL",
+                "PAUSE", "MODE_SWITCH"},
+    "VOLUME":  {"VOLUME", "PAUSE", "MODE_SWITCH"},
+    "ZOOM":    {"ZOOM", "PAUSE", "MODE_SWITCH"},
+    "PRESENT": {"MOVE_CURSOR", "LEFT_CLICK", "SWIPE_LEFT", "SWIPE_RIGHT",
+                "PAUSE", "MODE_SWITCH"},
+}
+
+
+#  MATH HELPERS
+
+def edist(a, b):
+    """Euclidean distance between two MediaPipe NormalizedLandmarks."""
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
+
+def hand_scale(lm):
+    """Wrist-to-middle-MCP distance; normalises all thresholds to hand size."""
+    return edist(lm[0], lm[9]) + 1e-6
+
+def ndist(a, b, hs):
+    """Normalised distance (divided by hand scale)."""
+    return edist(a, b) / hs
+
+def fingers_state(lm):
+    """
+    Returns (up: list[bool], hs: float).
+    up[0]=thumb, up[1]=index, up[2]=middle, up[3]=ring, up[4]=pinky.
+    Thumb rule: tip.x < MCP.x works because the frame is mirrored.
+    Others: tip.y < PIP.y (tip above PIP joint in image coordinates).
+    """
+    hs = hand_scale(lm)
+    up = [
+        lm[4].x  < lm[3].x,   # thumb
+        lm[8].y  < lm[6].y,   # index
+        lm[12].y < lm[10].y,  # middle
+        lm[16].y < lm[14].y,  # ring
+        lm[20].y < lm[18].y,  # pinky
+    ]
+    return up, hs
+
+#  GESTURE BUFFER — debounce / stability
+
+class GestureBuffer:
+    """
+    Sliding window debounce.  Each frame we push which raw gestures are
+    present; a gesture only fires when its deque is full and the True ratio
+    >= its required confidence.  MODE_SWITCH requires 100% ratio (36/36).
+    """
+    def __init__(self):     
+        self.buffers = {g: deque(maxlen=BUFFER_CFG[g][0]) for g in BUFFER_CFG}
+
+    def push(self, raw_gestures):
+        """raw_gestures: list of candidate gesture names detected this frame."""
+        for g in self.buffers:
+            self.buffers[g].append(g in raw_gestures)
+
+    def confirmed(self, mode):
+        """Return highest-priority confirmed gesture for the current mode."""
+        allowed = MODE_GESTURES[mode]
+        results = []
+        for g, buf in self.buffers.items():
+            if g not in allowed:
+                continue
+            size, ratio = BUFFER_CFG[g]
+            if len(buf) == size and sum(buf) / size >= ratio:
+                results.append(g)
+        if not results:
+            return "IDLE"
+        return min(results, key=lambda g: PRIORITY[g])
+
+
+#  CURSOR SMOOTHER — exponential moving average
+
+class CursorSmoother:
+    """
+    Dual-speed EMA: fast alpha when hand moves quickly, slow alpha when still.
+    This gives snappy large movements AND steady fine positioning.
+    """
+    def __init__(self, alpha_slow=0.25, alpha_fast=0.65, speed_threshold=80):
+        self.alpha_slow      = alpha_slow       # smooth when nearly still
+        self.alpha_fast      = alpha_fast       # responsive when moving fast
+        self.speed_threshold = speed_threshold  # pixels/frame to switch modes
+        self.sx = SCREEN_W / 2
+        self.sy = SCREEN_H / 2
+
+    def update(self, rx, ry):
+        dist = math.sqrt((rx - self.sx) ** 2 + (ry - self.sy) ** 2)
+        # blend alpha based on movement speed
+        t     = min(dist / self.speed_threshold, 1.0)
+        alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
+        self.sx = alpha * rx + (1 - alpha) * self.sx
+        self.sy = alpha * ry + (1 - alpha) * self.sy
+        return int(self.sx), int(self.sy)
+
+
+#  VISUAL EFFECTS
+
+CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
+FINGERTIPS = [4, 8, 12, 16, 20]
+
+
+class Particle:
+    def __init__(self, x, y, color):
+        self.x     = x + random.randint(-8, 8)
+        self.y     = y + random.randint(-8, 8)
+        self.vx    = random.uniform(-2.5, 2.5)
+        self.vy    = random.uniform(-4, -0.5)
+        self.life  = 1.0
+        self.decay = random.uniform(0.035, 0.08)
+        self.size  = random.randint(2, 6)
+        self.color = color
+
+    def update(self):
+        self.vy  += 0.1
+        self.x   += self.vx
+        self.y   += self.vy
+        self.life -= self.decay
+        return self.life > 0
+
+    def draw(self, frame):
+        c = tuple(int(v * self.life) for v in self.color)
+        cv2.circle(frame, (int(self.x), int(self.y)),
+                   max(1, int(self.size * self.life)), c, -1)
+
+
+class Ripple:
+    def __init__(self, x, y, color):
+        self.x, self.y, self.r, self.color = x, y, 5, color
+        self.max_r = 70
+        self.life  = 1.0
+
+    def update(self):
+        self.r    += 5
+        self.life  = max(0, 1 - self.r / self.max_r)
+        return self.r < self.max_r
+
+    def draw(self, frame):
+        c = tuple(int(v * self.life) for v in self.color)
+        cv2.circle(frame, (int(self.x), int(self.y)), int(self.r), c, 2)
+        cv2.circle(frame, (int(self.x), int(self.y)),
+                   max(1, int(self.r * 0.6)), c, 1)
+
+
+class TrailSystem:
+    def __init__(self, maxlen=30, lifetime=0.4):
+        self.pts = deque(maxlen=maxlen)
+        self.lt  = lifetime
+
+    def push(self, x, y):
+        self.pts.append((x, y, time.time()))
+
+    def draw(self, frame, color):
+        now   = time.time()
+        valid = [(x, y, t) for x, y, t in self.pts if now - t < self.lt]
+        for k in range(1, len(valid)):
+            a = (k - 1) / max(len(valid) - 1, 1)
+            c = tuple(int(v * a) for v in color)
+            cv2.line(frame,
+                     (valid[k-1][0], valid[k-1][1]),
+                     (valid[k][0],   valid[k][1]),
+                     c, max(1, int(4 * a)))
+
+
+def glow_circle(frame, cx, cy, r, color, layers=4):
+    for i in range(layers, 0, -1):
+        ov = frame.copy()
+        cv2.circle(ov, (cx, cy), r + (layers - i) * 4, color, -1)
+        cv2.addWeighted(ov, 0.12 * i / layers, frame,
+                        1 - 0.12 * i / layers, 0, frame)
+
+
+def glow_line(frame, p1, p2, color, thick=2):
+    ov = frame.copy()
+    cv2.line(ov, p1, p2, color, thick + 6)
+    cv2.addWeighted(ov, 0.18, frame, 0.82, 0, frame)
+    cv2.line(frame, p1, p2, color, thick)
+
+
+def draw_hand(frame, lm, w, h, primary, accent):
+    for a, b in CONNECTIONS:
+        glow_line(frame,
+                  (int(lm[a].x * w), int(lm[a].y * h)),
+                  (int(lm[b].x * w), int(lm[b].y * h)),
+                  primary, 1)
+    for i, p in enumerate(lm):
+        x, y = int(p.x * w), int(p.y * h)
+        if i in FINGERTIPS:
+            glow_circle(frame, x, y, 9, accent, 5)
+            cv2.circle(frame, (x, y), 7, accent, -1)
+            cv2.circle(frame, (x, y), 9, (255, 255, 255), 1)
+        elif i == 0:
+            glow_circle(frame, x, y, 7, primary, 3)
+            cv2.circle(frame, (x, y), 5, primary, -1)
+        else:
+            cv2.circle(frame, (x, y), 4, primary, -1)
+            cv2.circle(frame, (x, y), 5, (200, 200, 200), 1)
+
+
+def draw_hud(frame, mode, gesture, fps, w, h, primary, extra=""):
+    # top bar
+    ov = frame.copy()
+    cv2.rectangle(ov, (0, 0), (w, 58), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.6, frame, 0.4, 0, frame)
+    # mode badge
+    cv2.rectangle(frame, (8, 8), (130, 50), primary, -1)
+    cv2.putText(frame, mode, (16, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
+    # gesture colour
+    GCOL = {
+        "LEFT_CLICK":  (0, 255, 255),  "RIGHT_CLICK": (80, 80, 255),
+        "SCROLL":      (0, 180, 255),  "DRAG":        (255, 140, 0),
+        "VOLUME":      (0, 220, 255),  "ZOOM":        (255, 220, 0),
+        "PAUSE":       (200, 200, 0),  "MODE_SWITCH": (255, 60, 60),
+        "SWIPE_LEFT":  (255, 100, 180),"SWIPE_RIGHT": (100, 255, 180),
+        "IDLE":        (70, 70, 70),
+    }
+    gc = GCOL.get(gesture, (220, 220, 220))
+    cv2.putText(frame, gesture, (145, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, gc, 2, cv2.LINE_AA)
+    # fps
+    fc = (0, 255, 100) if fps > 20 else (0, 120, 255)
+    cv2.putText(frame, f"{fps}fps", (w - 90, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, fc, 2, cv2.LINE_AA)
+    # extra info
+    if extra:
+        cv2.putText(frame, extra, (w // 2 - 100, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, primary, 2, cv2.LINE_AA)
+    # bottom bar
+    ov2 = frame.copy()
+    cv2.rectangle(ov2, (0, h - 38), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(ov2, 0.5, frame, 0.5, 0, frame)
+    cv2.putText(frame,
+                "FIST 1.2s = next mode  |  PALM = pause  |  Q = quit",
+                (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.38, (110, 110, 110), 1, cv2.LINE_AA)
+    # corner brackets
+    br = 24; t = 2
+    for px, py, dx, dy in [
+        (0, 58, 1, 1), (w, 58, -1, 1),
+        (0, h - 38, 1, -1), (w, h - 38, -1, -1),
+    ]:
+        cv2.line(frame, (px, py), (px + dx * br, py), primary, t)
+        cv2.line(frame, (px, py), (px, py + dy * br), primary, t)
+
+
+def draw_mode_overlay(frame, mode, progress, w, h, primary):
+    ov = frame.copy()
+    cv2.rectangle(ov, (w // 2 - 180, h // 2 - 55),
+                  (w // 2 + 180, h // 2 + 55), (10, 10, 10), -1)
+    cv2.addWeighted(ov, 0.8, frame, 0.2, 0, frame)
+    cv2.rectangle(frame,
+                  (w // 2 - 180, h // 2 - 55),
+                  (w // 2 + 180, h // 2 + 55), primary, 2)
+    cv2.putText(frame, "MODE", (w // 2 - 155, h // 2 - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(frame, mode, (w // 2 - 155, h // 2 + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, primary, 2, cv2.LINE_AA)
+    bw = int(360 * progress)
+    cv2.rectangle(frame,
+                  (w // 2 - 180, h // 2 + 40),
+                  (w // 2 - 180 + bw, h // 2 + 50), primary, -1)
+
+
+def draw_volume_bar(frame, vol_pct, w, h, color):
+    bh = int((h - 100) * vol_pct)
+    bx = w - 35
+    cv2.rectangle(frame, (bx, 58), (bx + 22, h - 40), (30, 30, 30), -1)
+    cv2.rectangle(frame, (bx, h - 40 - bh), (bx + 22, h - 40), color, -1)
+    cv2.rectangle(frame, (bx, 58), (bx + 22, h - 40), color, 1)
+    cv2.putText(frame, f"{int(vol_pct * 100)}%", (bx - 10, h - 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MEDIAPIPE SETUP
+# ══════════════════════════════════════════════════════════════════════════
+latest_result = None
+
+
+def result_callback(result, _, ts):
+    global latest_result
+    latest_result = result
+
+
+if not os.path.exists(MODEL_FILE):
+    print("Downloading hand landmarker model (~8 MB)…")
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        MODEL_FILE,
+    )
+    print("Download complete.\n")
+
+#  MAIN LOOP
+
+try:
+    opts = mp_vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_FILE),
+        running_mode=mp_vision.RunningMode.LIVE_STREAM,
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        result_callback=result_callback,
+    )
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    if not cap.isOpened():
+        print(f"Camera {CAMERA_INDEX} not found. Try CAMERA_INDEX=1")
+        input("Press Enter to exit…")
+        raise SystemExit
+
+    buf       = GestureBuffer()
+    smoother  = CursorSmoother(alpha_slow=0.25, alpha_fast=0.65, speed_threshold=80)
+    trail     = TrailSystem()
+    particles = []
+    ripples   = []
+
+    mode_idx          = 0
+    mode_overlay      = 0.0
+    mode_switch_start = None
+
+    cooldown_last = {g: 0.0 for g in COOLDOWNS}
+
+    # Hysteresis states
+    pinch_state  = False
+    rmid_state   = False
+    drag_state   = False
+    drag_active  = False
+
+    scroll_ref  = None
+    swipe_start = None
+
+    prev_vol   = 0.5
+    cur_vol    = 0.5
+    prev_time  = time.time()
+    extra_hud  = ""
+
+    print("\n*** CYBERPUNK HAND CONTROLLER  v4.0 ***")
+    print("   Hold FIST 1.2 s to cycle modes")
+    print("   PALM = pause  |  Q = quit\n")
+    print("   Modes:", " -> ".join(MODES), "\n")
+
+    with mp_vision.HandLandmarker.create_from_options(opts) as detector:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+
+            # sci-fi dark tint
+            dark = np.zeros_like(frame)
+            dark[:] = (0, 8, 4)
+            cv2.addWeighted(dark, 0.25, frame, 0.75, 0, frame)
+
+            ts_ms  = int(time.time() * 1000)
+            mp_img = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            )
+            detector.detect_async(mp_img, ts_ms)
+
+            mode    = MODES[mode_idx]
+            primary = THEME[mode]["primary"]
+            accent  = THEME[mode]["accent"]
+            now     = time.time()
+            gesture = "IDLE"
+            extra_hud = ""
+
+            if latest_result and latest_result.hand_landmarks:
+                lm      = latest_result.hand_landmarks[0]
+                fi, hs  = fingers_state(lm)
+                draw_hand(frame, lm, w, h, primary, accent)
+
+                # Pre-compute normalised distances used by multiple gestures
+                pd_li   = ndist(lm[4], lm[8],  hs)   # thumb-index
+                pd_lm2  = ndist(lm[4], lm[12], hs)   # thumb-middle
+                pd_tp   = ndist(lm[4], lm[20], hs)   # thumb-pinky (volume)
+
+                ix, iy  = int(lm[8].x * w), int(lm[8].y * h)
+                trail.push(ix, iy)
+
+                # fingertip particle burst (low probability per frame)
+                for ti in FINGERTIPS:
+                    if random.random() < 0.3:
+                        particles.append(
+                            Particle(int(lm[ti].x * w),
+                                     int(lm[ti].y * h), primary)
+                        )
+
+                # ── RAW GESTURE CANDIDATES ─────────────────────────────
+                raw = []
+
+                all_up  = all(fi)
+                all_dn  = sum(fi) <= 1
+                idx_mid = fi[1] and fi[2] and not fi[3] and not fi[4]
+                idx_only = fi[1] and not fi[2] and not fi[3] and not fi[4]
+
+                if all_up:    raw.append("PAUSE")
+                if all_dn:    raw.append("MODE_SWITCH")
+                if idx_only:  raw.append("MOVE_CURSOR")
+                if idx_mid:   raw.append("SCROLL")
+
+                # Pinch / drag — with hysteresis to prevent boundary flicker
+                if pd_li  < T["PINCH_ON"] or (pinch_state and pd_li  < T["PINCH_OFF"]):
+                    raw.append("LEFT_CLICK")
+                if pd_lm2 < T["RMID_ON"]  or (rmid_state  and pd_lm2 < T["RMID_OFF"]):
+                    raw.append("RIGHT_CLICK")
+                if pd_li  < T["DRAG_ON"]  or (drag_state  and pd_li  < T["DRAG_OFF"]):
+                    raw.append("DRAG")
+
+                if mode == "VOLUME":
+                    raw.append("VOLUME")
+                if mode == "ZOOM" and idx_mid:
+                    raw.append("ZOOM")
+
+                # Swipe detection (PRESENT mode only)
+                if mode == "PRESENT" and idx_mid:
+                    if swipe_start is None:
+                        swipe_start = lm[8].x
+                    elif lm[8].x - swipe_start > T["SWIPE_MIN"]:
+                        raw.append("SWIPE_RIGHT")
+                    elif swipe_start - lm[8].x > T["SWIPE_MIN"]:
+                        raw.append("SWIPE_LEFT")
+                else:
+                    swipe_start = None
+
+                buf.push(raw)
+                gesture = buf.confirmed(mode)
+
+                # ── MODE SWITCH (hold fist ≥ 1.2 s) ──────────────────
+                if gesture == "MODE_SWITCH":
+                    if mode_switch_start is None:
+                        mode_switch_start = now
+                    held = now - mode_switch_start
+                    draw_mode_overlay(frame, mode, min(held / 1.2, 1.0),
+                                      w, h, primary)
+                    if (held >= 1.2 and
+                            now - cooldown_last.get("MODE_SWITCH", 0)
+                            > COOLDOWNS["MODE_SWITCH"]):
+                        mode_idx   = (mode_idx + 1) % len(MODES)
+                        mode       = MODES[mode_idx]
+                        primary    = THEME[mode]["primary"]
+                        accent     = THEME[mode]["accent"]
+                        mode_overlay = 2.0
+                        mode_switch_start = None
+                        cooldown_last["MODE_SWITCH"] = now
+                        # reset all gesture states on mode change
+                        pinch_state = drag_state = drag_active = False
+                        scroll_ref  = None
+                else:
+                    mode_switch_start = None
+
+                # ── EXECUTE CONFIRMED GESTURE ──────────────────────────
+                if gesture == "PAUSE":
+                    scroll_ref = None
+                    if drag_active:
+                        pyautogui.mouseUp()
+                        drag_active = False
+
+                elif gesture == "MOVE_CURSOR" and gesture != "LEFT_CLICK":
+                    # Map centre 60% of camera frame to full screen
+                    # so you don't need to move hand to extreme corners
+                    MARGIN = 0.20   # ignore outer 20% on each side
+                    raw_x = (lm[8].x - MARGIN) / (1.0 - 2 * MARGIN)
+                    raw_y = (lm[8].y - MARGIN) / (1.0 - 2 * MARGIN)
+                    raw_x = float(np.clip(raw_x, 0.0, 1.0))
+                    raw_y = float(np.clip(raw_y, 0.0, 1.0))
+                    sx, sy = smoother.update(
+                        int(raw_x * SCREEN_W),
+                        int(raw_y * SCREEN_H),
+                    )
+                    pyautogui.moveTo(sx, sy)
+                    scroll_ref = None
+
+                elif gesture == "LEFT_CLICK":
+                    pinch_state = pd_li < T["PINCH_OFF"]
+                    if (not pinch_state and
+                            now - cooldown_last.get("LEFT_CLICK", 0)
+                            > COOLDOWNS["LEFT_CLICK"]):
+                        pyautogui.click()
+                        cooldown_last["LEFT_CLICK"] = now
+                        cx  = int((lm[4].x + lm[8].x) / 2 * w)
+                        cy2 = int((lm[4].y + lm[8].y) / 2 * h)
+                        for _ in range(30):
+                            particles.append(Particle(cx, cy2, (0, 255, 255)))
+                        ripples.append(Ripple(cx, cy2, (0, 255, 255)))
+
+                elif gesture == "RIGHT_CLICK":
+                    rmid_state = pd_lm2 < T["RMID_OFF"]
+                    if (not rmid_state and
+                            now - cooldown_last.get("RIGHT_CLICK", 0)
+                            > COOLDOWNS["RIGHT_CLICK"]):
+                        pyautogui.rightClick()
+                        cooldown_last["RIGHT_CLICK"] = now
+                        cx  = int(lm[9].x * w)
+                        cy2 = int(lm[9].y * h)
+                        for _ in range(25):
+                            particles.append(Particle(cx, cy2, (80, 80, 255)))
+                        ripples.append(Ripple(cx, cy2, (80, 80, 255)))
+
+                elif gesture == "DRAG":
+                    drag_state = pd_li < T["DRAG_OFF"]
+                    sx, sy = smoother.update(
+                        int(lm[8].x * SCREEN_W),
+                        int(lm[8].y * SCREEN_H),
+                    )
+                    if not drag_active:
+                        pyautogui.mouseDown()
+                        drag_active = True
+                    pyautogui.moveTo(sx, sy)
+
+                else:
+                    # Any non-drag gesture releases mouse if dragging
+                    if drag_active:
+                        pyautogui.mouseUp()
+                        drag_active = False
+
+                # Scroll — accumulates sub-pixel deltas for smooth continuous scroll
+                if gesture == "SCROLL":
+                    cy2 = int((lm[8].y + lm[12].y) / 2 * h)
+                    if scroll_ref is None:
+                        scroll_ref = cy2
+                    else:
+                        delta = scroll_ref - cy2
+                        if abs(delta) / h > T["SCROLL_DEAD"]:
+                            # scale by SCROLL_SPEED, minimum ±1 so it always moves
+                            scroll_amt = delta / h * T["SCROLL_SPEED"]
+                            if abs(scroll_amt) < 1:
+                                scroll_amt = math.copysign(1, scroll_amt)
+                            pyautogui.scroll(int(scroll_amt))
+                        scroll_ref = cy2
+                else:
+                    scroll_ref = None
+
+                # Volume control
+                if gesture == "VOLUME" and mode == "VOLUME":
+                    vol_norm = float(np.clip(
+                        (pd_tp - 0.10) / (0.55 - 0.10), 0, 1
+                    ))
+                    cur_vol = 0.85 * cur_vol + 0.15 * vol_norm
+                    if HAS_VOLUME and volume_ctrl is not None:
+                        db = VOL_MIN + (VOL_MAX - VOL_MIN) * cur_vol
+                        volume_ctrl.SetMasterVolumeLevel(db, None)
+                    else:
+                        if cur_vol > prev_vol + 0.03:
+                            pyautogui.press("volumeup")
+                        elif cur_vol < prev_vol - 0.03:
+                            pyautogui.press("volumedown")
+                    prev_vol = cur_vol
+                    draw_volume_bar(frame, cur_vol, w, h, primary)
+                    extra_hud = f"VOL {int(cur_vol * 100)}%"
+
+                # Zoom control
+                if gesture == "ZOOM" and mode == "ZOOM":
+                    zm = float(np.clip(
+                        (pd_li - 0.08) / (0.50 - 0.08), 0, 1
+                    ))
+                    if zm > 0.6:
+                        pyautogui.hotkey("ctrl", "+")
+                    elif zm < 0.3:
+                        pyautogui.hotkey("ctrl", "-")
+                    extra_hud = f"ZOOM {int(zm * 100)}%"
+
+                # Swipe execution
+                if (gesture == "SWIPE_LEFT" and
+                        now - cooldown_last.get("SWIPE_LEFT", 0)
+                        > COOLDOWNS["SWIPE_LEFT"]):
+                    pyautogui.hotkey("left")
+                    cooldown_last["SWIPE_LEFT"] = now
+                    ripples.append(Ripple(w // 4, h // 2, primary))
+                    swipe_start = None
+
+                if (gesture == "SWIPE_RIGHT" and
+                        now - cooldown_last.get("SWIPE_RIGHT", 0)
+                        > COOLDOWNS["SWIPE_RIGHT"]):
+                    pyautogui.hotkey("right")
+                    cooldown_last["SWIPE_RIGHT"] = now
+                    ripples.append(Ripple(3 * w // 4, h // 2, primary))
+                    swipe_start = None
+
+            else:
+                # No hand detected — clear all gesture state
+                buf.push([])
+                mode_switch_start = None
+                if drag_active:
+                    pyautogui.mouseUp()
+                    drag_active = False
+
+            # ── DRAW EFFECTS
+            trail.draw(frame, accent)
+            particles[:] = [p for p in particles if p.update()]
+            for p in particles:
+                p.draw(frame)
+            ripples[:] = [r for r in ripples if r.update()]
+            for r in ripples:
+                r.draw(frame)
+
+            if mode_overlay > 0:
+                mode_overlay -= 1 / 30
+                draw_mode_overlay(frame, mode, 1.0, w, h, primary)
+
+            curr      = time.time()
+            fps       = int(1 / max(curr - prev_time, 1e-6))
+            prev_time = curr
+            draw_hud(frame, mode, gesture, fps, w, h, primary, extra_hud)
+
+            cv2.imshow("CYBERPUNK HAND CONTROLLER  v4.0  |  Q = quit", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+except Exception:
+    print("\n--- ERROR ---")
+    traceback.print_exc()
+    input("\nPress Enter to exit…")
+
+finally:
+    try:
+        cap.release()
+    except Exception:
+        pass
+    if drag_active:
+        try:
+            pyautogui.mouseUp()
+        except Exception:
+            pass
+    cv2.destroyAllWindows()
+    print("Controller stopped.")
+
+
+"""
+╔══════════════════════════════════════════════════════════╗
+║     CYBERPUNK HAND CONTROLLER  —  FULL SYSTEM v4.0      ║
+║  Gestures · Debounce · Modes · Volume · Zoom · Drag     ║
+╚══════════════════════════════════════════════════════════╝
+
+INSTALL:
+    pip install mediapipe opencv-python pyautogui numpy
+    pip install pycaw comtypes        ← optional, Windows only (volume control)
+
+RUN:
+    python hand_controller_v4.py
+
+MODES  (hold FIST 1.2s to cycle):
+    CURSOR      → move, click, right-click, drag, scroll
+    VOLUME      → thumb+pinky distance controls system volume
+    ZOOM        → pinch spread controls zoom (ctrl +/-)
+    PRESENT     → index=laser, swipe=next/prev slide
+
+═══════════════════════════════════════════════════════════
+  GESTURE RULE SYSTEM — DESIGN REFERENCE
+═══════════════════════════════════════════════════════════
+
+1. FINGER STATE DETECTION
+   ─────────────────────
+   Hand scale S = dist(lm[0], lm[9])   ← wrist to middle-finger MCP
+   All distance thresholds are divided by S (normalised).
+
+   Thumb  : UP  when  lm[4].x  < lm[3].x   (right hand, mirrored frame)
+   Index  : UP  when  lm[8].y  < lm[6].y   (tip above PIP joint)
+   Middle : UP  when  lm[12].y < lm[10].y
+   Ring   : UP  when  lm[16].y < lm[14].y
+   Pinky  : UP  when  lm[20].y < lm[18].y
+
+2. GESTURE DEFINITIONS
+   ────────────────────
+   MOVE_CURSOR   index up only (fi=[F,T,F,F,F]), others down
+   LEFT_CLICK    dist(lm4, lm8) / S < 0.12  (thumb-index pinch)
+   RIGHT_CLICK   dist(lm4, lm12)/ S < 0.12  (thumb-middle pinch)
+   DRAG          dist(lm4, lm8) / S < 0.09  (tighter pinch = drag)
+   SCROLL        index+middle up (fi=[F,T,T,F,F]), track Δy of midpoint
+   VOLUME        thumb-pinky dist / S → map [0.10, 0.55] → [0%, 100%]
+   ZOOM          index+middle up in ZOOM mode; pd_li → ctrl+/ctrl-
+   PAUSE         all 5 fingers up (open palm)
+   MODE_SWITCH   full fist (≤1 finger up), held ≥ 1.2 s = 36 frames @ 30fps
+   SWIPE_LEFT    index+middle up, Δx < -0.20 * S
+   SWIPE_RIGHT   index+middle up, Δx >  0.20 * S
+
+3. DISTANCE & THRESHOLDS
+   ──────────────────────
+   edist(a,b) = sqrt((a.x-b.x)² + (a.y-b.y)² + (a.z-b.z)²)
+   ndist(a,b) = edist(a,b) / hand_scale
+
+   Pinch ON  < 0.12  |  Pinch OFF  < 0.18   ← hysteresis band
+   Drag  ON  < 0.09  |  Drag  OFF  < 0.15
+   Swipe min travel > 0.20 (normalised units)
+   Scroll dead-zone > 0.015 of frame height (filters micro-jitter)
+
+4. STABILITY / DEBOUNCE
+   ─────────────────────
+   Each gesture has a deque of size N. Every frame pushes True/False.
+   Gesture fires when: sum(deque) / N  >=  R  (confidence ratio)
+
+   MOVE_CURSOR  : N=3,  R=0.67
+   LEFT_CLICK   : N=5,  R=0.80
+   RIGHT_CLICK  : N=6,  R=0.83
+   DRAG         : N=4,  R=0.75
+   SCROLL       : N=4,  R=0.75
+   VOLUME/ZOOM  : N=3,  R=0.67
+   MODE_SWITCH  : N=36, R=1.00   ← all 36 frames must be fist
+
+5. CONFLICT RESOLUTION
+   ────────────────────
+   Multiple gestures may trigger simultaneously (e.g. LEFT_CLICK and DRAG
+   both detect a tight pinch). Priority table resolves this:
+
+   1  PAUSE         (safety — overrides everything)
+   2  MODE_SWITCH
+   3  LEFT_CLICK
+   4  RIGHT_CLICK
+   5  DRAG
+   6  SCROLL / VOLUME / ZOOM
+   7  SWIPE_LEFT / SWIPE_RIGHT
+   8  MOVE_CURSOR
+   9  IDLE
+
+   Only the lowest-numbered confirmed gesture executes per frame.
+
+6. SMOOTH TRANSITIONS
+   ───────────────────
+   Cooldown gates (minimum seconds between repeated activations):
+   LEFT_CLICK   0.40 s
+   RIGHT_CLICK  0.50 s
+   MODE_SWITCH  2.00 s
+   SWIPE        0.60 s
+
+   Cursor uses exponential moving average (α=0.35):
+   sx = α * raw_x + (1-α) * sx_prev
+
+7. EXTENSIBILITY
+   ──────────────
+   To add a new gesture:
+   a) Add key to BUFFER_CFG  {'MY_GESTURE': (N, R)}
+   b) Add to COOLDOWNS if it needs rate-limiting
+   c) Add to PRIORITY dict
+   d) Add to relevant MODE_GESTURES sets
+   e) Append to raw[] in the raw-gesture-candidates block
+   f) Add execution block in the EXECUTE GESTURE section
+
+8. ADVANCED: HAND ORIENTATION
+   ─────────────────────────
+   Left vs right: compare lm[17].x (pinky MCP) vs lm[5].x (index MCP)
+   If lm[17].x > lm[5].x → left hand (in mirrored frame)
+
+   Gesture zones: map lm[8] to screen quadrant and gate gestures.
+   e.g. scroll only active when index tip is in left 30% of frame.
+"""
