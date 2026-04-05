@@ -191,3 +191,136 @@ class GestureBuffer:
             return "IDLE"
         return min(results, key=lambda g: PRIORITY[g])
 
+#  CURSOR SMOOTHER — exponential moving average
+
+class CursorSmoother:
+    """
+    Dual-speed EMA: fast alpha when hand moves quickly, slow alpha when still.
+    This gives snappy large movements AND steady fine positioning.
+    """
+    def __init__(self, alpha_slow=0.25, alpha_fast=0.65, speed_threshold=80):
+        self.alpha_slow      = alpha_slow       # smooth when nearly still
+        self.alpha_fast      = alpha_fast       # responsive when moving fast
+        self.speed_threshold = speed_threshold  # pixels/frame to switch modes
+        self.sx = SCREEN_W / 2
+        self.sy = SCREEN_H / 2
+
+    def update(self, rx, ry):
+        dist = math.sqrt((rx - self.sx) ** 2 + (ry - self.sy) ** 2)
+        # blend alpha based on movement speed
+        t     = min(dist / self.speed_threshold, 1.0)
+        alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
+        self.sx = alpha * rx + (1 - alpha) * self.sx
+        self.sy = alpha * ry + (1 - alpha) * self.sy
+        return int(self.sx), int(self.sy)
+
+
+#  VISUAL EFFECTS
+
+CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
+FINGERTIPS = [4, 8, 12, 16, 20]
+
+
+class Particle:
+    def __init__(self, x, y, color):
+        self.x     = x + random.randint(-8, 8)
+        self.y     = y + random.randint(-8, 8)
+        self.vx    = random.uniform(-2.5, 2.5)
+        self.vy    = random.uniform(-4, -0.5)
+        self.life  = 1.0
+        self.decay = random.uniform(0.035, 0.08)
+        self.size  = random.randint(2, 6)
+        self.color = color
+
+    def update(self):
+        self.vy  += 0.1
+        self.x   += self.vx
+        self.y   += self.vy
+        self.life -= self.decay
+        return self.life > 0
+
+    def draw(self, frame):
+        c = tuple(int(v * self.life) for v in self.color)
+        cv2.circle(frame, (int(self.x), int(self.y)),
+                   max(1, int(self.size * self.life)), c, -1)
+
+
+class Ripple:
+    def __init__(self, x, y, color):
+        self.x, self.y, self.r, self.color = x, y, 5, color
+        self.max_r = 70
+        self.life  = 1.0
+
+    def update(self):
+        self.r    += 5
+        self.life  = max(0, 1 - self.r / self.max_r)
+        return self.r < self.max_r
+
+    def draw(self, frame):
+        c = tuple(int(v * self.life) for v in self.color)
+        cv2.circle(frame, (int(self.x), int(self.y)), int(self.r), c, 2)
+        cv2.circle(frame, (int(self.x), int(self.y)),
+                   max(1, int(self.r * 0.6)), c, 1)
+
+
+class TrailSystem:
+    def __init__(self, maxlen=30, lifetime=0.4):
+        self.pts = deque(maxlen=maxlen)
+        self.lt  = lifetime
+
+    def push(self, x, y):
+        self.pts.append((x, y, time.time()))
+
+    def draw(self, frame, color):
+        now   = time.time()
+        valid = [(x, y, t) for x, y, t in self.pts if now - t < self.lt]
+        for k in range(1, len(valid)):
+            a = (k - 1) / max(len(valid) - 1, 1)
+            c = tuple(int(v * a) for v in color)
+            cv2.line(frame,
+                     (valid[k-1][0], valid[k-1][1]),
+                     (valid[k][0],   valid[k][1]),
+                     c, max(1, int(4 * a)))
+
+
+def glow_circle(frame, cx, cy, r, color, layers=4):
+    for i in range(layers, 0, -1):
+        ov = frame.copy()
+        cv2.circle(ov, (cx, cy), r + (layers - i) * 4, color, -1)
+        cv2.addWeighted(ov, 0.12 * i / layers, frame,
+                        1 - 0.12 * i / layers, 0, frame)
+
+
+def glow_line(frame, p1, p2, color, thick=2):
+    ov = frame.copy()
+    cv2.line(ov, p1, p2, color, thick + 6)
+    cv2.addWeighted(ov, 0.18, frame, 0.82, 0, frame)
+    cv2.line(frame, p1, p2, color, thick)
+
+
+def draw_hand(frame, lm, w, h, primary, accent):
+    for a, b in CONNECTIONS:
+        glow_line(frame,
+                  (int(lm[a].x * w), int(lm[a].y * h)),
+                  (int(lm[b].x * w), int(lm[b].y * h)),
+                  primary, 1)
+    for i, p in enumerate(lm):
+        x, y = int(p.x * w), int(p.y * h)
+        if i in FINGERTIPS:
+            glow_circle(frame, x, y, 9, accent, 5)
+            cv2.circle(frame, (x, y), 7, accent, -1)
+            cv2.circle(frame, (x, y), 9, (255, 255, 255), 1)
+        elif i == 0:
+            glow_circle(frame, x, y, 7, primary, 3)
+            cv2.circle(frame, (x, y), 5, primary, -1)
+        else:
+            cv2.circle(frame, (x, y), 4, primary, -1)
+            cv2.circle(frame, (x, y), 5, (200, 200, 200), 1)
+
