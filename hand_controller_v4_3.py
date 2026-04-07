@@ -324,3 +324,97 @@ def draw_hand(frame, lm, w, h, primary, accent):
             cv2.circle(frame, (x, y), 4, primary, -1)
             cv2.circle(frame, (x, y), 5, (200, 200, 200), 1)
 
+def draw_hud(frame, mode, gesture, fps, w, h, primary, extra=""):
+    # top bar
+    ov = frame.copy()
+    cv2.rectangle(ov, (0, 0), (w, 58), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.6, frame, 0.4, 0, frame)
+    # mode badge
+    cv2.rectangle(frame, (8, 8), (130, 50), primary, -1)
+    cv2.putText(frame, mode, (16, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
+    # gesture colour
+    GCOL = {
+        "LEFT_CLICK":  (0, 255, 255),  "RIGHT_CLICK": (80, 80, 255),
+        "SCROLL":      (0, 180, 255),  "DRAG":        (255, 140, 0),
+        "VOLUME":      (0, 220, 255),  "ZOOM":        (255, 220, 0),
+        "PAUSE":       (200, 200, 0),  "MODE_SWITCH": (255, 60, 60),
+        "SWIPE_LEFT":  (255, 100, 180),"SWIPE_RIGHT": (100, 255, 180),
+        "IDLE":        (70, 70, 70),
+    }
+    gc = GCOL.get(gesture, (220, 220, 220))
+    cv2.putText(frame, gesture, (145, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, gc, 2, cv2.LINE_AA)
+    # fps
+    fc = (0, 255, 100) if fps > 20 else (0, 120, 255)
+    cv2.putText(frame, f"{fps}fps", (w - 90, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, fc, 2, cv2.LINE_AA)
+    # extra info
+    if extra:
+        cv2.putText(frame, extra, (w // 2 - 100, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, primary, 2, cv2.LINE_AA)
+    # bottom bar
+    ov2 = frame.copy()
+    cv2.rectangle(ov2, (0, h - 38), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(ov2, 0.5, frame, 0.5, 0, frame)
+    cv2.putText(frame,
+                "FIST 1.2s = next mode  |  PALM = pause  |  Q = quit",
+                (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.38, (110, 110, 110), 1, cv2.LINE_AA)
+    # corner brackets
+    br = 24; t = 2
+    for px, py, dx, dy in [
+        (0, 58, 1, 1), (w, 58, -1, 1),
+        (0, h - 38, 1, -1), (w, h - 38, -1, -1),
+    ]:
+        cv2.line(frame, (px, py), (px + dx * br, py), primary, t)
+        cv2.line(frame, (px, py), (px, py + dy * br), primary, t)
+
+
+def draw_mode_overlay(frame, mode, progress, w, h, primary):
+    ov = frame.copy()
+    cv2.rectangle(ov, (w // 2 - 180, h // 2 - 55),
+                  (w // 2 + 180, h // 2 + 55), (10, 10, 10), -1)
+    cv2.addWeighted(ov, 0.8, frame, 0.2, 0, frame)
+    cv2.rectangle(frame,
+                  (w // 2 - 180, h // 2 - 55),
+                  (w // 2 + 180, h // 2 + 55), primary, 2)
+    cv2.putText(frame, "MODE", (w // 2 - 155, h // 2 - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(frame, mode, (w // 2 - 155, h // 2 + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, primary, 2, cv2.LINE_AA)
+    bw = int(360 * progress)
+    cv2.rectangle(frame,
+                  (w // 2 - 180, h // 2 + 40),
+                  (w // 2 - 180 + bw, h // 2 + 50), primary, -1)
+
+
+def draw_volume_bar(frame, vol_pct, w, h, color):
+    bh = int((h - 100) * vol_pct)
+    bx = w - 35
+    cv2.rectangle(frame, (bx, 58), (bx + 22, h - 40), (30, 30, 30), -1)
+    cv2.rectangle(frame, (bx, h - 40 - bh), (bx + 22, h - 40), color, -1)
+    cv2.rectangle(frame, (bx, 58), (bx + 22, h - 40), color, 1)
+    cv2.putText(frame, f"{int(vol_pct * 100)}%", (bx - 10, h - 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+
+#  MEDIAPIPE SETUP
+
+latest_result = None
+
+
+def result_callback(result, _, ts):
+    global latest_result
+    latest_result = result
+
+
+if not os.path.exists(MODEL_FILE):
+    print("Downloading hand landmarker model (~8 MB)…")
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        MODEL_FILE,
+    )
+    print("Download complete.\n")
+
