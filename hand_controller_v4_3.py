@@ -418,3 +418,104 @@ if not os.path.exists(MODEL_FILE):
     )
     print("Download complete.\n")
 
+
+#  MAIN LOOP
+
+try:
+    opts = mp_vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_FILE),
+        running_mode=mp_vision.RunningMode.LIVE_STREAM,
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        result_callback=result_callback,
+    )
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    if not cap.isOpened():
+        print(f"Camera {CAMERA_INDEX} not found. Try CAMERA_INDEX=1")
+        input("Press Enter to exit…")
+        raise SystemExit
+
+    buf       = GestureBuffer()
+    smoother  = CursorSmoother(alpha_slow=0.25, alpha_fast=0.65, speed_threshold=80)
+    trail     = TrailSystem()
+    particles = []
+    ripples   = []
+
+    mode_idx          = 0
+    mode_overlay      = 0.0
+    mode_switch_start = None
+
+    cooldown_last = {g: 0.0 for g in COOLDOWNS}
+
+    # Hysteresis states
+    pinch_state  = False
+    rmid_state   = False
+    drag_state   = False
+    drag_active  = False
+
+    scroll_ref  = None
+    swipe_start = None
+
+    prev_vol   = 0.5
+    cur_vol    = 0.5
+    prev_time  = time.time()
+    extra_hud  = ""
+
+    print("\n*** CYBERPUNK HAND CONTROLLER  v4.0 ***")
+    print("   Hold FIST 1.2 s to cycle modes")
+    print("   PALM = pause  |  Q = quit\n")
+    print("   Modes:", " -> ".join(MODES), "\n")
+
+    with mp_vision.HandLandmarker.create_from_options(opts) as detector:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+
+            # sci-fi dark tint
+            dark = np.zeros_like(frame)
+            dark[:] = (0, 8, 4)
+            cv2.addWeighted(dark, 0.25, frame, 0.75, 0, frame)
+
+            ts_ms  = int(time.time() * 1000)
+            mp_img = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            )
+            detector.detect_async(mp_img, ts_ms)
+
+            mode    = MODES[mode_idx]
+            primary = THEME[mode]["primary"]
+            accent  = THEME[mode]["accent"]
+            now     = time.time()
+            gesture = "IDLE"
+            extra_hud = ""
+
+            if latest_result and latest_result.hand_landmarks:
+                lm      = latest_result.hand_landmarks[0]
+                fi, hs  = fingers_state(lm)
+                draw_hand(frame, lm, w, h, primary, accent)
+
+                # Pre-compute normalised distances used by multiple gestures
+                pd_li   = ndist(lm[4], lm[8],  hs)   # thumb-index
+                pd_lm2  = ndist(lm[4], lm[12], hs)   # thumb-middle
+                pd_tp   = ndist(lm[4], lm[20], hs)   # thumb-pinky (volume)
+
+                ix, iy  = int(lm[8].x * w), int(lm[8].y * h)
+                trail.push(ix, iy)
+
+                # fingertip particle burst (low probability per frame)
+                for ti in FINGERTIPS:
+                    if random.random() < 0.3:
+                        particles.append(
+                            Particle(int(lm[ti].x * w),
+                                     int(lm[ti].y * h), primary)
+                        )
