@@ -519,3 +519,167 @@ try:
                             Particle(int(lm[ti].x * w),
                                      int(lm[ti].y * h), primary)
                         )
+
+                        
+                # ── RAW GESTURE CANDIDATES ─────────────────────────────
+                raw = []
+
+                all_up  = all(fi)
+                all_dn  = sum(fi) <= 1
+                idx_mid = fi[1] and fi[2] and not fi[3] and not fi[4]
+                idx_only = fi[1] and not fi[2] and not fi[3] and not fi[4]
+
+                if all_up:    raw.append("PAUSE")
+                if all_dn:    raw.append("MODE_SWITCH")
+                if idx_only:  raw.append("MOVE_CURSOR")
+                if idx_mid:   raw.append("SCROLL")
+
+                # Pinch / drag — with hysteresis to prevent boundary flicker
+                if pd_li  < T["PINCH_ON"] or (pinch_state and pd_li  < T["PINCH_OFF"]):
+                    raw.append("LEFT_CLICK")
+                if pd_lm2 < T["RMID_ON"]  or (rmid_state  and pd_lm2 < T["RMID_OFF"]):
+                    raw.append("RIGHT_CLICK")
+                if pd_li  < T["DRAG_ON"]  or (drag_state  and pd_li  < T["DRAG_OFF"]):
+                    raw.append("DRAG")
+
+                if mode == "VOLUME":
+                    raw.append("VOLUME")
+                if mode == "ZOOM" and idx_mid:
+                    raw.append("ZOOM")
+
+                # Swipe detection (PRESENT mode only)
+                if mode == "PRESENT" and idx_mid:
+                    if swipe_start is None:
+                        swipe_start = lm[8].x
+                    elif lm[8].x - swipe_start > T["SWIPE_MIN"]:
+                        raw.append("SWIPE_RIGHT")
+                    elif swipe_start - lm[8].x > T["SWIPE_MIN"]:
+                        raw.append("SWIPE_LEFT")
+                else:
+                    swipe_start = None
+
+                buf.push(raw)
+                gesture = buf.confirmed(mode)
+
+                # ── MODE SWITCH (hold fist ≥ 1.2 s) ──────────────────
+                if gesture == "MODE_SWITCH":
+                    if mode_switch_start is None:
+                        mode_switch_start = now
+                    held = now - mode_switch_start
+                    draw_mode_overlay(frame, mode, min(held / 1.2, 1.0),
+                                      w, h, primary)
+                    if (held >= 1.2 and
+                            now - cooldown_last.get("MODE_SWITCH", 0)
+                            > COOLDOWNS["MODE_SWITCH"]):
+                        mode_idx   = (mode_idx + 1) % len(MODES)
+                        mode       = MODES[mode_idx]
+                        primary    = THEME[mode]["primary"]
+                        accent     = THEME[mode]["accent"]
+                        mode_overlay = 2.0
+                        mode_switch_start = None
+                        cooldown_last["MODE_SWITCH"] = now
+                        # reset all gesture states on mode change
+                        pinch_state = drag_state = drag_active = False
+                        scroll_ref  = None
+                else:
+                    mode_switch_start = None
+
+                # ── EXECUTE CONFIRMED GESTURE ──────────────────────────
+                if gesture == "PAUSE":
+                    scroll_ref = None
+                    if drag_active:
+                        pyautogui.mouseUp()
+                        drag_active = False
+
+                elif gesture == "MOVE_CURSOR" and gesture != "LEFT_CLICK":
+                    # Map centre 60% of camera frame to full screen
+                    # so you don't need to move hand to extreme corners
+                    MARGIN = 0.20   # ignore outer 20% on each side
+                    raw_x = (lm[8].x - MARGIN) / (1.0 - 2 * MARGIN)
+                    raw_y = (lm[8].y - MARGIN) / (1.0 - 2 * MARGIN)
+                    raw_x = float(np.clip(raw_x, 0.0, 1.0))
+                    raw_y = float(np.clip(raw_y, 0.0, 1.0))
+                    sx, sy = smoother.update(
+                        int(raw_x * SCREEN_W),
+                        int(raw_y * SCREEN_H),
+                    )
+                    pyautogui.moveTo(sx, sy)
+                    scroll_ref = None
+
+                elif gesture == "LEFT_CLICK":
+                    pinch_state = pd_li < T["PINCH_OFF"]
+                    if (not pinch_state and
+                            now - cooldown_last.get("LEFT_CLICK", 0)
+                            > COOLDOWNS["LEFT_CLICK"]):
+                        pyautogui.click()
+                        cooldown_last["LEFT_CLICK"] = now
+                        cx  = int((lm[4].x + lm[8].x) / 2 * w)
+                        cy2 = int((lm[4].y + lm[8].y) / 2 * h)
+                        for _ in range(30):
+                            particles.append(Particle(cx, cy2, (0, 255, 255)))
+                        ripples.append(Ripple(cx, cy2, (0, 255, 255)))
+
+                elif gesture == "RIGHT_CLICK":
+                    rmid_state = pd_lm2 < T["RMID_OFF"]
+                    if (not rmid_state and
+                            now - cooldown_last.get("RIGHT_CLICK", 0)
+                            > COOLDOWNS["RIGHT_CLICK"]):
+                        pyautogui.rightClick()
+                        cooldown_last["RIGHT_CLICK"] = now
+                        cx  = int(lm[9].x * w)
+                        cy2 = int(lm[9].y * h)
+                        for _ in range(25):
+                            particles.append(Particle(cx, cy2, (80, 80, 255)))
+                        ripples.append(Ripple(cx, cy2, (80, 80, 255)))
+
+                elif gesture == "DRAG":
+                    drag_state = pd_li < T["DRAG_OFF"]
+                    sx, sy = smoother.update(
+                        int(lm[8].x * SCREEN_W),
+                        int(lm[8].y * SCREEN_H),
+                    )
+                    if not drag_active:
+                        pyautogui.mouseDown()
+                        drag_active = True
+                    pyautogui.moveTo(sx, sy)
+
+                else:
+                    # Any non-drag gesture releases mouse if dragging
+                    if drag_active:
+                        pyautogui.mouseUp()
+                        drag_active = False
+
+                # Scroll — accumulates sub-pixel deltas for smooth continuous scroll
+                if gesture == "SCROLL":
+                    cy2 = int((lm[8].y + lm[12].y) / 2 * h)
+                    if scroll_ref is None:
+                        scroll_ref = cy2
+                    else:
+                        delta = scroll_ref - cy2
+                        if abs(delta) / h > T["SCROLL_DEAD"]:
+                            # scale by SCROLL_SPEED, minimum ±1 so it always moves
+                            scroll_amt = delta / h * T["SCROLL_SPEED"]
+                            if abs(scroll_amt) < 1:
+                                scroll_amt = math.copysign(1, scroll_amt)
+                            pyautogui.scroll(int(scroll_amt))
+                        scroll_ref = cy2
+                else:
+                    scroll_ref = None
+
+                # Volume control
+                if gesture == "VOLUME" and mode == "VOLUME":
+                    vol_norm = float(np.clip(
+                        (pd_tp - 0.10) / (0.55 - 0.10), 0, 1
+                    ))
+                    cur_vol = 0.85 * cur_vol + 0.15 * vol_norm
+                    if HAS_VOLUME and volume_ctrl is not None:
+                        db = VOL_MIN + (VOL_MAX - VOL_MIN) * cur_vol
+                        volume_ctrl.SetMasterVolumeLevel(db, None)
+                    else:
+                        if cur_vol > prev_vol + 0.03:
+                            pyautogui.press("volumeup")
+                        elif cur_vol < prev_vol - 0.03:
+                            pyautogui.press("volumedown")
+                    prev_vol = cur_vol
+                    draw_volume_bar(frame, cur_vol, w, h, primary)
+                    extra_hud = f"VOL {int(cur_vol * 100)}%"
