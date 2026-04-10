@@ -683,3 +683,80 @@ try:
                     prev_vol = cur_vol
                     draw_volume_bar(frame, cur_vol, w, h, primary)
                     extra_hud = f"VOL {int(cur_vol * 100)}%"
+                  extra_hud = f"VOL {int(cur_vol * 100)}%"
+
+                # Zoom control
+                if gesture == "ZOOM" and mode == "ZOOM":
+                    zm = float(np.clip(
+                        (pd_li - 0.08) / (0.50 - 0.08), 0, 1
+                    ))
+                    if zm > 0.6:
+                        pyautogui.hotkey("ctrl", "+")
+                    elif zm < 0.3:
+                        pyautogui.hotkey("ctrl", "-")
+                    extra_hud = f"ZOOM {int(zm * 100)}%"
+
+                # Swipe execution
+                if (gesture == "SWIPE_LEFT" and
+                        now - cooldown_last.get("SWIPE_LEFT", 0)
+                        > COOLDOWNS["SWIPE_LEFT"]):
+                    pyautogui.hotkey("left")
+                    cooldown_last["SWIPE_LEFT"] = now
+                    ripples.append(Ripple(w // 4, h // 2, primary))
+                    swipe_start = None
+
+                if (gesture == "SWIPE_RIGHT" and
+                        now - cooldown_last.get("SWIPE_RIGHT", 0)
+                        > COOLDOWNS["SWIPE_RIGHT"]):
+                    pyautogui.hotkey("right")
+                    cooldown_last["SWIPE_RIGHT"] = now
+                    ripples.append(Ripple(3 * w // 4, h // 2, primary))
+                    swipe_start = None
+
+            else:
+                # No hand detected — clear all gesture state
+                buf.push([])
+                mode_switch_start = None
+                if drag_active:
+                    pyautogui.mouseUp()
+                    drag_active = False
+
+            # ── DRAW EFFECTS
+            trail.draw(frame, accent)
+            particles[:] = [p for p in particles if p.update()]
+            for p in particles:
+                p.draw(frame)
+            ripples[:] = [r for r in ripples if r.update()]
+            for r in ripples:
+                r.draw(frame)
+
+            if mode_overlay > 0:
+                mode_overlay -= 1 / 30
+                draw_mode_overlay(frame, mode, 1.0, w, h, primary)
+
+            curr      = time.time()
+            fps       = int(1 / max(curr - prev_time, 1e-6))
+            prev_time = curr
+            draw_hud(frame, mode, gesture, fps, w, h, primary, extra_hud)
+
+            cv2.imshow("CYBERPUNK HAND CONTROLLER  v4.0  |  Q = quit", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+except Exception:
+    print("\n--- ERROR ---")
+    traceback.print_exc()
+    input("\nPress Enter to exit…")
+
+finally:
+    try:
+        cap.release()
+    except Exception:
+        pass
+    if drag_active:
+        try:
+            pyautogui.mouseUp()
+        except Exception:
+            pass
+    cv2.destroyAllWindows()
+    print("Controller stopped.")
