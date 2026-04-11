@@ -760,3 +760,118 @@ finally:
             pass
     cv2.destroyAllWindows()
     print("Controller stopped.")
+"""
+
+     CYBERPUNK HAND CONTROLLER  —  FULL SYSTEM v4.0      
+ Gestures · Debounce · Modes · Volume · Zoom · Drag     
+
+
+INSTALL:
+    pip install mediapipe opencv-python pyautogui numpy
+    pip install pycaw comtypes        ← optional, Windows only (volume control)
+
+RUN:
+    python hand_controller_v4.py
+
+MODES  (hold FIST 1.2s to cycle):
+    CURSOR      → move, click, right-click, drag, scroll
+    VOLUME      → thumb+pinky distance controls system volume
+    ZOOM        → pinch spread controls zoom (ctrl +/-)
+    PRESENT     → index=laser, swipe=next/prev slide
+
+  GESTURE RULE SYSTEM — DESIGN REFERENCE
+
+
+1. FINGER STATE DETECTION
+
+   Hand scale S = dist(lm[0], lm[9])   ← wrist to middle-finger MCP
+   All distance thresholds are divided by S (normalised).
+
+   Thumb  : UP  when  lm[4].x  < lm[3].x   (right hand, mirrored frame)
+   Index  : UP  when  lm[8].y  < lm[6].y   (tip above PIP joint)
+   Middle : UP  when  lm[12].y < lm[10].y
+   Ring   : UP  when  lm[16].y < lm[14].y
+   Pinky  : UP  when  lm[20].y < lm[18].y
+
+2. GESTURE DEFINITIONS
+
+   MOVE_CURSOR   index up only (fi=[F,T,F,F,F]), others down
+   LEFT_CLICK    dist(lm4, lm8) / S < 0.12  (thumb-index pinch)
+   RIGHT_CLICK   dist(lm4, lm12)/ S < 0.12  (thumb-middle pinch)
+   DRAG          dist(lm4, lm8) / S < 0.09  (tighter pinch = drag)
+   SCROLL        index+middle up (fi=[F,T,T,F,F]), track Δy of midpoint
+   VOLUME        thumb-pinky dist / S → map [0.10, 0.55] → [0%, 100%]
+   ZOOM          index+middle up in ZOOM mode; pd_li → ctrl+/ctrl-
+   PAUSE         all 5 fingers up (open palm)
+   MODE_SWITCH   full fist (≤1 finger up), held ≥ 1.2 s = 36 frames @ 30fps
+   SWIPE_LEFT    index+middle up, Δx < -0.20 * S
+   SWIPE_RIGHT   index+middle up, Δx >  0.20 * S
+
+3. DISTANCE & THRESHOLDS
+
+   edist(a,b) = sqrt((a.x-b.x)² + (a.y-b.y)² + (a.z-b.z)²)
+   ndist(a,b) = edist(a,b) / hand_scale
+
+   Pinch ON  < 0.12  |  Pinch OFF  < 0.18   ← hysteresis band
+   Drag  ON  < 0.09  |  Drag  OFF  < 0.15
+   Swipe min travel > 0.20 (normalised units)
+   Scroll dead-zone > 0.015 of frame height (filters micro-jitter)
+
+4. STABILITY / DEBOUNCE
+
+   Each gesture has a deque of size N. Every frame pushes True/False.
+   Gesture fires when: sum(deque) / N  >=  R  (confidence ratio)
+
+   MOVE_CURSOR  : N=3,  R=0.67
+   LEFT_CLICK   : N=5,  R=0.80
+   RIGHT_CLICK  : N=6,  R=0.83
+   DRAG         : N=4,  R=0.75
+   SCROLL       : N=4,  R=0.75
+   VOLUME/ZOOM  : N=3,  R=0.67
+   MODE_SWITCH  : N=36, R=1.00   ← all 36 frames must be fist
+
+5. CONFLICT RESOLUTION
+
+   Multiple gestures may trigger simultaneously (e.g. LEFT_CLICK and DRAG
+   both detect a tight pinch). Priority table resolves this:
+
+   1  PAUSE         (safety — overrides everything)
+   2  MODE_SWITCH
+   3  LEFT_CLICK
+   4  RIGHT_CLICK
+   5  DRAG
+   6  SCROLL / VOLUME / ZOOM
+   7  SWIPE_LEFT / SWIPE_RIGHT
+   8  MOVE_CURSOR
+   9  IDLE
+
+   Only the lowest-numbered confirmed gesture executes per frame.
+
+6. SMOOTH TRANSITIONS
+
+   Cooldown gates (minimum seconds between repeated activations):
+   LEFT_CLICK   0.40 s
+   RIGHT_CLICK  0.50 s
+   MODE_SWITCH  2.00 s
+   SWIPE        0.60 s
+
+   Cursor uses exponential moving average (α=0.35):
+   sx = α * raw_x + (1-α) * sx_prev
+
+7. EXTENSIBILITY
+
+   To add a new gesture:
+   a) Add key to BUFFER_CFG  {'MY_GESTURE': (N, R)}
+   b) Add to COOLDOWNS if it needs rate-limiting
+   c) Add to PRIORITY dict
+   d) Add to relevant MODE_GESTURES sets
+   e) Append to raw[] in the raw-gesture-candidates block
+   f) Add execution block in the EXECUTE GESTURE section
+
+8
+   Left vs right: compare lm[17].x (pinky MCP) vs lm[5].x (index MCP)
+   If lm[17].x > lm[5].x → left hand (in mirrored frame)
+
+   Gesture zones: map lm[8] to screen quadrant and gate gestures.
+   e.g. scroll only active when index tip is in left 30% of frame.
+"""
